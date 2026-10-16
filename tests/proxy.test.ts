@@ -77,7 +77,7 @@ test("a double slash cannot change upstream origin", async () => {
   expect(response.status).toBe(200);
 });
 
-test.each([301, 302, 307, 308])(
+test.each([300, 301, 302, 303, 305, 306, 307, 308, 399])(
   "upstream redirect %s is refused without settlement",
   async (status) => {
     const { app, events } = harness({
@@ -98,6 +98,35 @@ test.each([301, 302, 307, 308])(
   },
 );
 
+test("304 Not Modified is forwarded for conditional requests", async () => {
+  const { app, events } = harness({
+    upstream: async (request) => {
+      expect(request.headers.get("if-none-match")).toBe('"abc123"');
+      return new Response(null, {
+        status: 304,
+        headers: {
+          etag: '"abc123"',
+          "last-modified": "Wed, 21 Oct 2026 07:28:00 GMT",
+        },
+      });
+    },
+  });
+  const response = await app.request("/v1/echo", {
+    headers: {
+      "if-none-match": '"abc123"',
+      "payment-signature": await signature(app),
+    },
+  });
+  expect(response.status).toBe(304);
+  expect(await response.text()).toBe("");
+  expect(response.headers.get("etag")).toBe('"abc123"');
+  expect(response.headers.get("last-modified")).toBe(
+    "Wed, 21 Oct 2026 07:28:00 GMT",
+  );
+  // The upstream answered the client's question, so the charge settles.
+  expect(events).toEqual(["verify", "upstream", "settle"]);
+});
+
 test("oversized request never reaches upstream", async () => {
   const { app, events } = harness({ env: { MAX_BODY_BYTES: "4" } });
   const response = await app.request("/v1/echo", {
@@ -107,6 +136,39 @@ test("oversized request never reaches upstream", async () => {
   });
   expect(response.status).toBe(413);
   expect(events).toEqual(["verify"]);
+});
+
+test("declared oversized request is rejected before payment verification", async () => {
+  const { app, events } = harness({ env: { MAX_BODY_BYTES: "4" } });
+  const response = await app.request("/v1/echo", {
+    method: "POST",
+    body: "12345",
+    headers: {
+      "content-length": "5",
+      "payment-signature": "not-inspected",
+    },
+  });
+  expect(response.status).toBe(413);
+  expect(await response.json()).toEqual({ error: "request_too_large" });
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(events).toEqual([]);
+});
+
+test("declared body at the limit still follows the payment flow", async () => {
+  const { app, events } = harness({
+    env: { MAX_BODY_BYTES: "4" },
+    upstream: async () => new Response("ok"),
+  });
+  const response = await app.request("/v1/echo", {
+    method: "POST",
+    body: "1234",
+    headers: {
+      "content-length": "4",
+      "payment-signature": await signature(app),
+    },
+  });
+  expect(response.status).toBe(200);
+  expect(events).toEqual(["verify", "upstream", "settle"]);
 });
 
 test("oversized response does not settle", async () => {

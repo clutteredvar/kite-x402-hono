@@ -2,6 +2,8 @@ import type { Config } from "./config.js";
 
 export type FetchUpstream = (request: Request) => Promise<Response>;
 
+export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
+
 const blocked = new Set([
   "connection",
   "keep-alive",
@@ -37,9 +39,12 @@ export function cleanHeaders(source: Headers, authHeader: string): Headers {
   for (const key of [...headers.keys()]) {
     if (
       blocked.has(key) ||
+      (key === "x-request-id" &&
+        !REQUEST_ID_PATTERN.test(headers.get(key) ?? "")) ||
       key === authHeader ||
       connectionTokens.includes(key) ||
-      key.startsWith("x402-")
+      key.startsWith("x402-") ||
+      key.startsWith("access-control-")
     )
       headers.delete(key);
   }
@@ -147,8 +152,13 @@ export async function proxy(
         redirect: "manual",
       }),
     );
-    // No redirect following: an upstream cannot forward the injected credential to another host.
-    if (upstream.status >= 300 && upstream.status < 400) {
+    // Only 304 is a supported non-2xx success; refuse other 3xx without settlement.
+    // Never follow redirects with the injected credential.
+    if (
+      upstream.status >= 300 &&
+      upstream.status < 400 &&
+      upstream.status !== 304
+    ) {
       void upstream.body?.cancel().catch(() => {});
       return Response.json(
         { error: "upstream_redirect_refused" },

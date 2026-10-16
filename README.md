@@ -30,10 +30,15 @@ In another terminal in the same directory:
 ```sh
 bun run start
 curl -i http://localhost:8080/healthz
+curl -i http://localhost:8080/readyz
 curl -i 'http://localhost:8080/v1/echo?message=hello'
 ```
 
-`/healthz` returns 200 without contacting a facilitator. `/v1/echo` returns
+`/healthz` returns 200 without contacting a facilitator. `/readyz` actually
+calls the facilitator's `/supported` endpoint and returns 200 only when the
+configured Kite network is offered with x402 v2 and the exact scheme, so orchestrators can distinguish
+"process up" from "supported payment protocol". This does not prove that
+the upstream is ready or that a payment will settle. `/v1/echo` returns
 402 with an x402 v2 `PAYMENT-REQUIRED` header when the configured facilitator
 is reachable and supports the selected network. A facilitator outage returns
 503 instead; the upstream is never called without verified payment.
@@ -68,19 +73,22 @@ injection for tests. Never use a simulated facilitator in a production service.
 
 ## Configuration
 
-| Variable               | Default                              | Meaning                                                                         |
-| ---------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
-| `PAY_TO`               | Required                             | Nonzero EVM receiving address                                                   |
-| `UPSTREAM_URL`         | Required                             | Fixed HTTP(S) origin, with no path, credentials or query                        |
-| `KITE_NETWORK`         | `mainnet`                            | `mainnet` or `testnet`                                                          |
-| `PRICE_USD`            | `0.001`                              | Positive decimal, at most 6 fractional digits; optional `$` prefix              |
-| `FACILITATOR_URL`      | `https://facilitator.pieverse.io/v2` | Keep the `/v2` suffix                                                           |
-| `UPSTREAM_AUTH_HEADER` | `Authorization`                      | Upstream credential header name                                                 |
-| `UPSTREAM_AUTH_VALUE`  | Empty                                | Server-side credential; replaces buyer-supplied values                          |
-| `SERVICE_DESCRIPTION`  | Kite paid API description            | Included in the payment challenge                                               |
-| `PORT`                 | `8080`                               | Wrapper port                                                                    |
-| `UPSTREAM_TIMEOUT_MS`  | `10000`                              | Timeout for reading the request body, then separately for upstream headers/body |
-| `MAX_BODY_BYTES`       | `1048576`                            | Request and response byte limit; maximum 16 MiB                                 |
+| Variable                  | Default                              | Meaning                                                                         |
+| ------------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
+| `PAY_TO`                  | Required                             | Nonzero EVM receiving address                                                   |
+| `UPSTREAM_URL`            | Required                             | Fixed HTTP(S) origin, with no path, credentials or query                        |
+| `KITE_NETWORK`            | `mainnet`                            | `mainnet` or `testnet`                                                          |
+| `PRICE_USD`               | `0.001`                              | Positive decimal, at most 6 fractional digits; optional `$` prefix              |
+| `FACILITATOR_URL`         | `https://facilitator.pieverse.io/v2` | Keep the `/v2` suffix                                                           |
+| `UPSTREAM_AUTH_HEADER`    | `Authorization`                      | Upstream credential header name                                                 |
+| `UPSTREAM_AUTH_VALUE`     | Empty                                | Server-side credential; replaces buyer-supplied values                          |
+| `SERVICE_DESCRIPTION`     | Kite paid API description            | Included in the payment challenge                                               |
+| `PORT`                    | `8080`                               | Wrapper port                                                                    |
+| `UPSTREAM_TIMEOUT_MS`     | `10000`                              | Timeout for reading the request body, then separately for upstream headers/body |
+| `MAX_BODY_BYTES`          | `1048576`                            | Request and response byte limit; maximum 16 MiB                                 |
+| `MAX_CONCURRENT_REQUESTS` | `64`                                 | Concurrency admission limit for `/v1/*` requests (1 to 10000)                   |
+| `FACILITATOR_TIMEOUT_MS`  | `90000`                              | Timeout in ms for facilitator network requests (1 to 300000)                    |
+| `CORS_ORIGIN`             | Unset                                | Allowed origin for CORS (`*` or HTTP(S) origin); enables browser dApp clients   |
 
 HTTPS is required for upstream/facilitator URLs except localhost development.
 The example `.env` explicitly selects testnet; the compatibility default remains
@@ -100,7 +108,7 @@ integer arithmetic, including for testnet's 18 decimals.
 1. No payment or invalid payment: return 402; do not call the upstream.
 2. Verified payment: strip `/v1`, preserve the query/method/body, inject the
    configured upstream credential, and call the fixed upstream origin.
-3. Upstream 2xx: buffer the bounded response, then ask the facilitator to settle.
+3. Upstream 2xx or conditional 304: buffer the bounded response, then ask the facilitator to settle.
 4. Successful settlement: return the upstream response and `PAYMENT-RESPONSE`.
 5. Upstream 4xx/5xx, timeout, oversized body or connection failure: do not settle.
 6. Settlement refusal: return the SDK failure response, withholding protected data.
@@ -112,18 +120,32 @@ Compatibility notes:
 - Unlike the reference template's general below-400 rule, this template **refuses
   upstream redirects** with 502, without settlement, so credentials cannot follow
   redirects to a different host. Use the final upstream origin directly.
+  Conditional `304 Not Modified` answers are not redirects and are forwarded, so
+  client-side `If-None-Match` / `If-Modified-Since` still works.
 - Payment headers, client authorization/cookies, proxy headers and hop-by-hop
   headers are removed. Upstream authentication response headers and cookies are
   also stripped. The upstream is trusted: do not select one that echoes secrets
   into response bodies or unrelated headers.
 - Response buffering is deliberate. Streaming/SSE, WebSocket and unbounded
   downloads are outside this template's scope.
+- Requests whose valid `Content-Length` already exceeds `MAX_BODY_BYTES` are
+  rejected before facilitator verification. Streaming, chunked and incorrectly
+  declared bodies are still enforced while the proxy reads them.
 - Upstream actions happen before settlement. For non-idempotent POST operations,
   settlement failure does not undo the upstream action. Use an upstream with
   idempotency support; the wrapper does not provide exactly-once execution.
 - A facilitator timeout may leave the on-chain settlement outcome unknown. An
   error response is not proof of no charge. Reconcile before retrying a payment.
 - `/healthz` is process liveness, not proof of upstream/facilitator readiness.
+  Use `/readyz` to check that the facilitator is reachable and offers the
+  configured network, x402 v2 and exact scheme. Each probe contacts the facilitator;
+  use an appropriate probe interval. It does not verify upstream health or actual settlement.
+- Every response carries an `X-Request-ID` header. Send your own `x-request-id`
+  (letters, digits, `.`, `_`, `~`, `-`, up to 128 chars) and it is echoed back and
+  forwarded upstream so agent, wrapper and upstream logs correlate; unsafe
+  values are replaced with a minted UUID in the response and stripped upstream.
+  IDs are caller-controlled correlation labels, not authentication or payment deduplication keys.
+  Generated IDs label the wrapper response; they are not injected upstream.
 - The CLI disables Bun's short idle timeout so it does not disconnect a client
   during settlement. SDK facilitator calls default to a configurable 90-second timeout;
   deploy behind a reverse proxy with suitable request deadlines and rate limits.
@@ -173,6 +195,22 @@ Readers release their locks on success and failure; successful bodies retain the
 original bytes. Cleanup is best-effort: an injected stream producer still owns its
 underlying resources. This does not cancel or undo payment settlement, and does
 not add payment retries.
+
+### CORS support (added in 0.3.2)
+
+Configure `CORS_ORIGIN` with `*` or a specific origin (e.g. `https://agent.kite.ai`)
+to enable web browsers, dApps, and AI agent frontends to make paid cross-origin calls:
+
+- Preflight `OPTIONS` requests receive `204 No Content` with appropriate
+  `Access-Control-Allow-*` headers without triggering payment middleware.
+  Only OPTIONS with Origin and Access-Control-Request-Method is preflight;
+  other OPTIONS requests still require payment. Upstream CORS headers are stripped
+  so the wrapper controls origin policy. CORS is not server-side authentication.
+- `402 Payment Required` challenge responses and successful responses expose
+  `Payment-Required`, `Payment-Response`, `Retry-After`, `X-Request-ID`, allowing browser `fetch`
+  clients to inspect payment requirements and payment settlement tokens.
+- When `CORS_ORIGIN` is unset (the default), CORS middleware is omitted entirely
+  with zero overhead and backwards-compatible behavior.
 
 ### Commands
 

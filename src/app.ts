@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import {
   paymentMiddlewareFromHTTPServer,
   x402HTTPResourceServer,
@@ -9,9 +10,9 @@ import {
   type FacilitatorClient,
 } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
-import { loadConfig, type Config } from "./config.js";
+import { loadConfig, parseCorsOrigin, type Config } from "./config.js";
 import { parsePrice } from "./networks.js";
-import { proxy, type FetchUpstream } from "./proxy.js";
+import { proxy, REQUEST_ID_PATTERN, type FetchUpstream } from "./proxy.js";
 
 export interface AppOptions {
   facilitator?: FacilitatorClient;
@@ -23,6 +24,66 @@ export function createApp(
   options: AppOptions = {},
 ): Hono {
   const app = new Hono();
+  // Label every response — paid answers, 402 challenges, guard-rail rejections
+  // and errors alike — with a request ID the caller can quote back in issues
+  // and correlate across agent, wrapper and upstream logs. A caller-supplied
+  // value is echoed only when it fits a conservative token alphabet, so the
+  // header cannot smuggle control characters or flood logs; anything else
+  // gets a freshly minted UUID. Caller-supplied IDs also travel upstream,
+  // because x-request-id is not on the proxy's blocked list.
+  app.use("*", async (c, next) => {
+    const inbound = c.req.header("x-request-id");
+    const requestId =
+      inbound && REQUEST_ID_PATTERN.test(inbound)
+        ? inbound
+        : crypto.randomUUID();
+    await next();
+    c.res.headers.set("x-request-id", requestId);
+  });
+  if (config.corsOrigin) {
+    const corsMiddleware = cors({
+      origin: parseCorsOrigin(config.corsOrigin),
+      allowMethods: [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+        "OPTIONS",
+      ],
+      allowHeaders: [
+        "Content-Type",
+        "Authorization",
+        "Payment-Signature",
+        "X-Payment",
+        "X-Requested-With",
+        "X-Request-ID",
+      ],
+      exposeHeaders: [
+        "Payment-Required",
+        "Payment-Response",
+        "X-Payment-Required",
+        "X-Payment-Response",
+        "Retry-After",
+        "X-Request-ID",
+      ],
+      maxAge: 86400,
+    });
+    app.use("*", (c, next) => {
+      // Only browser preflight bypasses the paid OPTIONS route.
+      if (
+        c.req.method === "OPTIONS" &&
+        !(
+          c.req.header("origin") &&
+          c.req.header("access-control-request-method")
+        )
+      ) {
+        return next();
+      }
+      return corsMiddleware(c, next);
+    });
+  }
   const facilitatorTimeoutMs = config.facilitatorTimeoutMs ?? 90000;
   if (
     !Number.isInteger(facilitatorTimeoutMs) ||
@@ -40,6 +101,23 @@ export function createApp(
     );
   }
   let active = 0;
+  // Reject a body that is already known to exceed the configured limit before
+  // contacting the facilitator. Chunked or incorrectly declared bodies remain
+  // protected by proxy's bounded stream reader.
+  app.use("/v1/*", async (c, next) => {
+    if (!["GET", "HEAD"].includes(c.req.method)) {
+      const declaredLength = c.req.header("content-length");
+      if (
+        declaredLength &&
+        /^\d+$/.test(declaredLength) &&
+        BigInt(declaredLength) > BigInt(config.maxBodyBytes)
+      ) {
+        c.header("Cache-Control", "no-store");
+        return c.json({ error: "request_too_large" }, 413);
+      }
+    }
+    await next();
+  });
   // Cover initialization, verification, upstream and settlement, not just proxy I/O.
   // Never queue payment-bearing requests or retain their signatures.
   app.use("/v1/*", async (c, next) => {
@@ -94,6 +172,45 @@ export function createApp(
       price: `$${config.price}`,
     }),
   );
+  // Readiness is stronger than liveness: the process is up and the facilitator
+  // advertises the configured protocol and network; this does not prove settlement.
+  app.get("/readyz", async (c) => {
+    let supported;
+    try {
+      supported = await facilitator.getSupported();
+    } catch {
+      return c.json({ ok: false, error: "facilitator_unavailable" }, 503, {
+        "cache-control": "no-store",
+      });
+    }
+    const offered = supported.kinds.some(
+      (kind) =>
+        kind.network === config.chain.network &&
+        kind.scheme === "exact" &&
+        kind.x402Version === 2,
+    );
+    if (!offered) {
+      return c.json(
+        {
+          ok: false,
+          error: "network_not_offered",
+          network: config.chain.network,
+        },
+        503,
+        { "cache-control": "no-store" },
+      );
+    }
+    return c.json(
+      {
+        ok: true,
+        network: config.chain.network,
+        asset: config.chain.symbol,
+        price: `$${config.price}`,
+      },
+      200,
+      { "cache-control": "no-store" },
+    );
+  });
   app.use("/v1/*", async (c, next) => {
     c.header("cache-control", "no-store");
     try {
